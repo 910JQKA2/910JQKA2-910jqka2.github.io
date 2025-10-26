@@ -1,0 +1,354 @@
+// roser.js — main logic
+"use strict";
+
+const $ = id => document.getElementById(id);
+const tabsEl = document.getElementById("tabs");
+const viewArea = document.getElementById("viewArea");
+const addressInput = document.getElementById("address");
+const status = document.getElementById("status");
+const backBtn = document.getElementById("backBtn");
+const forwardBtn = document.getElementById("forwardBtn");
+const reloadBtn = document.getElementById("reloadBtn");
+const newTabBtn = document.getElementById("newTabBtn");
+const goBtn = document.getElementById("goBtn");
+const bookmarkBtn = document.getElementById("bookmarkBtn");
+const bookmarksSelect = document.getElementById("bookmarks");
+
+let tabs = [];
+let tabIdCounter = 0;
+let bookmarks = JSON.parse(localStorage.getItem("roser_bookmarks") || "[]");
+
+// helper: normalize url & support 1.1.1.1:// -> https://
+function normalizeUrl(input) {
+  input = (input || "").trim();
+  if (!input) return null;
+  // if user typed search terms -> treat as https://www.google.com/search?q=...
+  const looksLikeUrl = /^[a-z0-9-]+\.[a-z]{2,}/i.test(input) || /^[a-z]+:\/\//i.test(input);
+  if (!looksLikeUrl) {
+    // treat as search
+    return "https://www.google.com/search?q=" + encodeURIComponent(input);
+  }
+  // add scheme if missing
+  if (!/^[a-z]+:\/\//i.test(input)) {
+    input = "https://" + input;
+  }
+  // special mapping: 1.1.1.1:// -> https://
+  input = input.replace(/^1\.1\.1\.1:\/\//i, "https://");
+  // basic security: disallow javascript: scheme
+  if (input.toLowerCase().startsWith("javascript:")) return null;
+  return input;
+}
+
+// Create a new tab object and DOM
+function createTab(url, makeActive = true) {
+  const id = "tab-" + (++tabIdCounter);
+  const tab = {
+    id,
+    history: [],
+    historyIndex: -1,
+    url: null,
+    iframe: null,
+    el: null,
+  };
+  // DOM tab button
+  const tabBtn = document.createElement("div");
+  tabBtn.className = "tab";
+  tabBtn.id = id;
+  tabBtn.innerHTML = `<span class="title">New tab</span><span class="close" title="Close">✕</span>`;
+  tabsEl.appendChild(tabBtn);
+
+  // click to select
+  tabBtn.addEventListener("click", (ev) => {
+    if (ev.target.classList.contains("close")) {
+      closeTab(id);
+      return;
+    }
+    activateTab(id);
+  });
+
+  // iframe
+  const iframe = document.createElement("iframe");
+  iframe.setAttribute("sandbox", "allow-forms allow-modals allow-popups allow-same-origin allow-scripts");
+  iframe.style.display = "none";
+  viewArea.appendChild(iframe);
+
+  tab.iframe = iframe;
+  tab.el = tabBtn;
+
+  tabs.push(tab);
+
+  if (url) navigateTab(tab.id, url);
+  if (makeActive) activateTab(id);
+  return tab;
+}
+
+function closeTab(id) {
+  const idx = tabs.findIndex(t => t.id === id);
+  if (idx === -1) return;
+  const tab = tabs[idx];
+  // remove DOM
+  if (tab.el) tab.el.remove();
+  if (tab.iframe) tab.iframe.remove();
+  tabs.splice(idx,1);
+  // activate left neighbor
+  if (tabs.length) {
+    const newIndex = Math.max(0, idx-1);
+    activateTab(tabs[newIndex].id);
+  } else {
+    // no tabs remain: create new homepage tab
+    createTab("https://example.com", true);
+  }
+}
+
+function activateTab(id) {
+  tabs.forEach(t => {
+    if (t.el) t.el.classList.remove("active");
+    if (t.iframe) t.iframe.style.display = "none";
+  });
+  const tab = tabs.find(t => t.id === id);
+  if (!tab) return;
+  tab.el.classList.add("active");
+  tab.iframe.style.display = "block";
+
+  // update address input
+  addressInput.value = tab.url || "";
+  updateNavButtons(tab);
+}
+
+// navigate (push history)
+function navigateTab(id, rawInput) {
+  const tab = tabs.find(t => t.id === id);
+  if (!tab) return;
+  const url = normalizeUrl(rawInput);
+  if (!url) {
+    setStatus("URL không hợp lệ hoặc bị chặn.", true);
+    return;
+  }
+
+  // if historyIndex not at end, trim forward
+  if (tab.historyIndex < tab.history.length - 1) {
+    tab.history = tab.history.slice(0, tab.historyIndex + 1);
+  }
+  tab.history.push(url);
+  tab.historyIndex = tab.history.length - 1;
+  tab.url = url;
+
+  loadUrlToIframe(tab, url);
+  renderTabTitle(tab, url);
+  updateNavButtons(tab);
+  setStatus("Đang tải: " + url);
+}
+
+// load into iframe and detect X-Frame-Options block
+function loadUrlToIframe(tab, url) {
+  const ifr = tab.iframe;
+  // show loading overlay (simple text)
+  ifr.style.display = "block";
+  ifr.src = url;
+
+  // set a timeout to detect blocking: if iframe didn't load within X sec, show fallback
+  let fired = false;
+  const timeout = setTimeout(() => {
+    if (fired) return;
+    // check if loaded by reading readyState? cross-origin prevents.
+    // We'll try showing a message and provide "Open in new tab" option
+    showBlockedFallback(tab, url);
+    fired = true;
+  }, 2500);
+
+  // Listen for load event — if loaded successfully, clear timeout and update title via postMessage if same-origin
+  function loaded() {
+    if (fired) return;
+    clearTimeout(timeout);
+    fired = true;
+    setStatus("Đã tải: " + url);
+    // try to update tab title via postMessage (only works same-origin)
+    try {
+      // attempt to access title from iframe (may throw cross-origin)
+      const t = ifr.contentDocument && ifr.contentDocument.title;
+      if (t) renderTabTitle(tab, url, t);
+      else renderTabTitle(tab, url);
+    } catch (e) {
+      renderTabTitle(tab, url);
+    }
+  }
+  ifr.onload = loaded;
+
+  // Also listen for error (rare)
+  ifr.onerror = function() {
+    if (fired) return;
+    clearTimeout(timeout);
+    fired = true;
+    setStatus("Không thể tải (error) " + url, true);
+    showBlockedFallback(tab, url);
+  };
+}
+
+// show blocked fallback overlay (small)
+function showBlockedFallback(tab, url) {
+  setStatus("Trang có thể chặn nhúng (iframe). Bạn có thể mở trang ngoài.");
+  // create a small overlay in viewArea
+  const overlay = document.createElement("div");
+  overlay.className = "blocked-overlay";
+  overlay.innerHTML = `<div class="box">
+    <div>Không thể nhúng trang này: <b>${escapeHtml(url)}</b></div>
+    <div class="actions">
+      <button id="openNew">Mở ngoài</button>
+      <button id="openPopup">Mở popup</button>
+      <button id="openRaw">Hiển thị HTML thô</button>
+    </div>
+  </div>`;
+  // style
+  overlay.style.position = "absolute";
+  overlay.style.inset = "12px";
+  overlay.style.background = "rgba(6,6,6,0.65)";
+  overlay.style.display = "flex";
+  overlay.style.alignItems = "center";
+  overlay.style.justifyContent = "center";
+  overlay.style.zIndex = 9999;
+  viewArea.appendChild(overlay);
+
+  overlay.querySelector("#openNew").addEventListener("click", () => {
+    window.open(url, "_blank");
+  });
+  overlay.querySelector("#openPopup").addEventListener("click", () => {
+    const w = window.open("", "_blank", "noopener,noreferrer,width=1000,height=700");
+    if (w) w.location = url;
+  });
+  overlay.querySelector("#openRaw").addEventListener("click", () => {
+    // load raw HTML via fetch and show in new window (CORS may block)
+    fetch(url, {mode:"cors"}).then(r=>r.text()).then(txt=>{
+      const w = window.open();
+      w.document.open();
+      w.document.write(`<pre style="white-space:pre-wrap;word-wrap:break-word;">${escapeHtml(txt)}</pre>`);
+      w.document.close();
+    }).catch(e=>{
+      alert("Không thể fetch HTML (CORS). Mở trang ngoài thay thế.");
+    });
+  });
+
+  // remove overlay on click anywhere
+  setTimeout(()=> {
+    overlay.addEventListener("click", e => {
+      if (e.target === overlay) overlay.remove();
+    });
+  }, 200);
+}
+
+// helper: render tab title
+function renderTabTitle(tab, url, title) {
+  const span = tab.el.querySelector(".title");
+  span.textContent = title ? title : (url.length > 40 ? url.slice(0,40)+"..." : url);
+}
+
+// navigation controls
+function updateNavButtons(tab) {
+  if (!tab) return;
+  backBtn.disabled = !(tab.historyIndex > 0);
+  forwardBtn.disabled = !(tab.historyIndex < tab.history.length - 1);
+}
+
+backBtn.addEventListener("click", ()=> {
+  const tab = tabs.find(t => t.el.classList.contains("active"));
+  if (!tab || tab.historyIndex <= 0) return;
+  tab.historyIndex--;
+  tab.url = tab.history[tab.historyIndex];
+  tab.iframe.src = tab.url;
+  addressInput.value = tab.url;
+  updateNavButtons(tab);
+});
+
+forwardBtn.addEventListener("click", ()=> {
+  const tab = tabs.find(t => t.el.classList.contains("active"));
+  if (!tab || tab.historyIndex >= tab.history.length - 1) return;
+  tab.historyIndex++;
+  tab.url = tab.history[tab.historyIndex];
+  tab.iframe.src = tab.url;
+  addressInput.value = tab.url;
+  updateNavButtons(tab);
+});
+
+reloadBtn.addEventListener("click", ()=> {
+  const tab = tabs.find(t => t.el.classList.contains("active"));
+  if (!tab) return;
+  tab.iframe.src = tab.url;
+  setStatus("Reloading...");
+});
+
+newTabBtn.addEventListener("click", ()=> {
+  createTab("about:blank", true);
+});
+
+goBtn.addEventListener("click", ()=> {
+  const raw = addressInput.value.trim();
+  const activeTab = tabs.find(t => t.el.classList.contains("active"));
+  if (!activeTab) return;
+  navigateTab(activeTab.id, raw);
+});
+
+// Enter key in address bar
+addressInput.addEventListener("keydown", (e)=>{
+  if (e.key === "Enter") {
+    goBtn.click();
+  }
+});
+
+// bookmarks
+function refreshBookmarksUI(){
+  bookmarksSelect.innerHTML = "<option value=''>Bookmarks</option>";
+  bookmarks.forEach((b,i)=>{
+    const opt = document.createElement("option");
+    opt.value = b.url;
+    opt.textContent = b.title || b.url;
+    bookmarksSelect.appendChild(opt);
+  });
+  localStorage.setItem("roser_bookmarks", JSON.stringify(bookmarks));
+}
+bookmarkBtn.addEventListener("click", ()=>{
+  const tab = tabs.find(t => t.el.classList.contains("active"));
+  if (!tab || !tab.url) return;
+  bookmarks.push({title: tab.url, url: tab.url});
+  refreshBookmarksUI();
+});
+bookmarksSelect.addEventListener("change", ()=>{
+  const v = bookmarksSelect.value;
+  if (!v) return;
+  const tab = tabs.find(t => t.el.classList.contains("active"));
+  if (!tab) return;
+  navigateTab(tab.id, v);
+});
+
+// utility
+function setStatus(text, isError){
+  status.textContent = text;
+  status.style.color = isError ? "#ff8b8b" : "";
+}
+
+// small HTML escape
+function escapeHtml(s){ return (s+"").replace(/[&<>"']/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
+
+// init: create first tab
+createTab("https://example.com", true);
+refreshBookmarksUI();
+
+// restore last session (optional)
+window.addEventListener("beforeunload", ()=>{
+  const session = tabs.map(t=>({history:t.history, index:t.historyIndex}));
+  localStorage.setItem("roser_session", JSON.stringify(session));
+});
+
+// try restore
+(function tryRestore(){
+  const s = localStorage.getItem("roser_session");
+  if (!s) return;
+  try {
+    const session = JSON.parse(s);
+    if (!Array.isArray(session) || session.length === 0) return;
+    // remove default tab(s)
+    tabs.slice().forEach(t => closeTab(t.id));
+    session.forEach((tObj, i)=>{
+      const u = (tObj.history && tObj.history[tObj.historyIndex]) || "https://example.com";
+      createTab(u, i===0);
+    });
+  } catch(e){}
+})();
